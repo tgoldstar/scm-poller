@@ -1,2 +1,3 @@
 # scm-poller
-Poll for SCM changes
+
+Poll for changes in remote SCM.  
