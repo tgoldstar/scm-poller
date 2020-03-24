@@ -1,0 +1,4 @@
+repositories:
+- remote_url: "http://localhost:8080/root/demo"
+  reference: "master"
+  interval: "1s"

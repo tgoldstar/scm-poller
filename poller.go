@@ -1,86 +1,79 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"os"
-	"time"
+	"os/signal"
 
+	"github.com/spf13/afero"
+	"github.com/tgoldstar/scm-poller/pkg/config"
+	"github.com/tgoldstar/scm-poller/pkg/poller"
+	"github.com/tgoldstar/scm-poller/pkg/store"
 	"github.com/urfave/cli/v2"
-	"gopkg.in/src-d/go-git.v4"
-	"gopkg.in/src-d/go-git.v4/config"
-	"gopkg.in/src-d/go-git.v4/plumbing"
-	"gopkg.in/src-d/go-git.v4/storage/memory"
 )
 
-var commitHistroy map[string]plumbing.Hash = make(map[string]plumbing.Hash)
-
-func poll(remote string, tracking []string) error {
-	trackingSet := make(map[string]struct{})
-	for _, branch := range tracking {
-		trackingSet[branch] = struct{}{}
+var (
+	configFile     string
+	configFileFlag = &cli.StringFlag{
+		Name:        "config-file",
+		Aliases:     []string{"f"},
+		Destination: &configFile,
+		Usage:       "YAML configuration file path",
+		EnvVars:     []string{"SCM_POLLER_CONFIG_FILE"},
+		Required:    true,
 	}
+)
 
-	log.Print("Initializing cache...")
+func handleEvents(ctx context.Context, logger *log.Logger, changes <-chan poller.Change, errs <-chan poller.PollError) {
+	for {
+		select {
+		case change := <-changes:
+			log.Println(change)
+		case err := <-errs:
+			log.Println(err)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
 
-	rem := git.NewRemote(memory.NewStorage(), &config.RemoteConfig{
-		Name: "origin",
-		URLs: []string{remote},
-	})
+func startPolling(c *cli.Context) error {
+	opts, err := (&config.File{
+		FileSystem: afero.NewOsFs(),
+		Path:       configFile,
+	}).Fetch()
 
-	refs, err := rem.List(&git.ListOptions{})
 	if err != nil {
 		return err
 	}
 
-	for _, ref := range refs {
-		name := ref.Name().Short()
-		hash := ref.Hash()
+	logger := log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lmicroseconds|log.Lshortfile)
+	p := poller.New(logger, store.NewMemoryStore(), poller.Git{})
+	changes := make(chan (poller.Change), 1000)
+	errs := make(chan poller.PollError, 1000)
+	ctx, cancel := context.WithCancel(context.Background())
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt)
 
-		if _, ok := trackingSet[name]; ok {
-			log.Printf("Setting %s to %v", name, hash)
-			commitHistroy[name] = hash
-		}
-	}
-
-	log.Println("Polling remote for changes...")
-	pollTicker := time.NewTicker(1 * time.Second)
-
-	for _ = range pollTicker.C {
-		refs, err := rem.List(&git.ListOptions{})
-		if err != nil {
-			return err
-		}
-		for _, ref := range refs {
-			name := ref.Name().Short()
-			current := ref.Hash()
-
-			if previous, ok := commitHistroy[name]; ok {
-				if current != previous {
-					log.Printf("Branch %s was changed from %v to %v", name, previous, current)
-					commitHistroy[name] = current
-				}
-			}
-		}
-	}
+	go p.Poll(ctx, opts, changes, errs)
+	go handleEvents(ctx, logger, changes, errs)
+	<-sigChan
+	fmt.Println("Exiting...")
+	cancel()
 
 	return nil
 }
 
 func main() {
 	app := &cli.App{
-		Name:                 "scm-poller",
-		EnableBashCompletion: true,
-		BashComplete:         cli.ShowCompletions,
-		Usage:                "Poll remote SCM for changes",
-		ArgsUsage:            "<remote> <branch>",
-		Action: func(c *cli.Context) error {
-			remote := c.Args().Get(0)
-			branch := c.Args().Get(1)
-			if remote == "" || branch == "" {
-				cli.ShowAppHelpAndExit(c, 1)
-			}
-			return poll(remote, []string{branch})
+		Name:  "scm-poller",
+		Usage: "Poll remote SCM repositories for changes",
+		Flags: []cli.Flag{
+			configFileFlag,
 		},
+		Action: startPolling,
 	}
 
 	err := app.Run(os.Args)
